@@ -277,6 +277,8 @@
 #     args = parser.parse_args()
 #     main(args)
 
+#####################################
+## Vrersion 002
 
 """
 train_hrnet_pluck_improved.py
@@ -552,7 +554,7 @@ if __name__ == "__main__":
     parser.add_argument("--backbone", type=str, default="hrnet_w18", help="timm backbone name")
     parser.add_argument("--img_size", type=int, default=640, help="input crop size")
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_step", type=int, default=15)
     parser.add_argument("--lr_gamma", type=float, default=0.5)
