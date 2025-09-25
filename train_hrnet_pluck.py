@@ -278,21 +278,17 @@
 #     main(args)
 
 #####################################
-## Vrersion 002
-
 """
-train_hrnet_pluck_improved.py
+train_hrnet_pluck_v003.py
 
-Train HRNet-W18 backbone + regression head to predict plucking point (x,y)
-normalized in crop coordinates, preserving aspect ratio.
-
-Usage:
-    python train_hrnet_pluck_improved.py --data_dir final_dataset --epochs 50 --batch_size 16 --img_size 640 --out model_pluck_best.pth
+Improved HRNet-W18 plucking point regressor with:
+- Aspect-ratio preserving padding
+- Mixed precision training
+- Smooth checkpointing and pixel distance metric
 """
 
 import os
 import argparse
-from glob import glob
 from tqdm import tqdm
 
 import torch
@@ -302,28 +298,17 @@ from torchvision import transforms
 from PIL import Image
 
 import timm
-from timm.data import resolve_data_config, create_transform
-
+from timm.data import resolve_data_config
 from torch.cuda.amp import autocast, GradScaler
-import math
 
 # ---------------------------
 # Dataset
 # ---------------------------
 class PluckCropDataset(Dataset):
-    """
-    Expects:
-      img_dir: images e.g. xxx.jpg
-      label_dir: labels xxx.txt
-      Each label line: cls x_center y_center w h pluck_x pluck_y (pluck_x, pluck_y normalized in [0,1])
-    Returns:
-      img_tensor (C,H,W), target tensor([pluck_x, pluck_y])
-    """
-    def __init__(self, img_dir, label_dir, img_size=640, transform=None):
+    def __init__(self, img_dir, label_dir, transform=None):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.img_files = sorted([p for p in os.listdir(img_dir) if p.lower().endswith((".jpg",".png",".jpeg"))])
-        self.img_size = img_size
         self.transform = transform
 
     def __len__(self):
@@ -343,19 +328,24 @@ class PluckCropDataset(Dataset):
         px = float(line[5])
         py = float(line[6])
 
-        # Pad to square while preserving aspect ratio
+        # Pad to square
         max_dim = max(w, h)
         canvas = Image.new("RGB", (max_dim, max_dim), (0,0,0))
         pad_x = (max_dim - w)//2
         pad_y = (max_dim - h)//2
         canvas.paste(img, (pad_x, pad_y))
+
         # Adjust keypoint
         px = (px * w + pad_x)/max_dim
         py = (py * h + pad_y)/max_dim
         target = torch.tensor([px, py], dtype=torch.float32)
 
         # Transform
-        img_t = self.transform(canvas)
+        if self.transform:
+            img_t = self.transform(canvas)
+        else:
+            img_t = transforms.ToTensor()(canvas)
+
         return img_t, target, fname
 
 # ---------------------------
@@ -371,13 +361,12 @@ class HRNetPluckRegressor(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(head_hidden, 2),
-            nn.Sigmoid()  # normalized output
+            nn.Sigmoid()  # normalized coordinates
         )
 
     def forward(self, x):
         feat = self.backbone(x)
-        out = self.regressor(feat)
-        return out
+        return self.regressor(feat)
 
 # ---------------------------
 # Training / Validation
@@ -399,9 +388,8 @@ def train_one_epoch(model, loader, optimizer, device, criterion, scaler):
         total_loss += loss.item() * imgs.size(0)
         total_mae += torch.abs(preds - targets).mean(dim=1).sum().item()
 
-    avg_loss = total_loss / len(loader.dataset)
-    avg_mae = total_mae / len(loader.dataset)
-    return avg_loss, avg_mae
+    n = len(loader.dataset)
+    return total_loss/n, total_mae/n
 
 def validate(model, loader, device, criterion, img_size):
     model.eval()
@@ -417,16 +405,13 @@ def validate(model, loader, device, criterion, img_size):
             total_loss += loss.item() * imgs.size(0)
             total_mae += torch.abs(preds - targets).mean(dim=1).sum().item()
 
-            # Pixel distance
+            # pixel distance
             px = preds * img_size
             tx = targets * img_size
             total_px_dist += torch.sqrt(((px - tx)**2).sum(dim=1)).sum().item()
 
     n = len(loader.dataset)
-    avg_loss = total_loss / n
-    avg_mae = total_mae / n
-    avg_px_dist = total_px_dist / n
-    return avg_loss, avg_mae, avg_px_dist
+    return total_loss/n, total_mae/n, total_px_dist/n
 
 # ---------------------------
 # Utilities
@@ -441,7 +426,7 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() and args.device >= 0 else "cpu"
     print("Device:", device)
 
-    # timm data config
+    # timm transform
     dummy_model = timm.create_model(args.backbone, pretrained=False)
     data_config = resolve_data_config({}, model=dummy_model)
 
@@ -460,7 +445,7 @@ def main(args):
     # dataset
     img_dir = os.path.join(args.data_dir, "images")
     lbl_dir = os.path.join(args.data_dir, "labels")
-    dataset = PluckCropDataset(img_dir, lbl_dir, img_size=args.img_size, transform=train_transform)
+    dataset = PluckCropDataset(img_dir, lbl_dir, transform=train_transform)
     n = len(dataset)
     val_size = int(n * args.val_split)
     train_size = n - val_size
@@ -501,7 +486,7 @@ def main(args):
         print(f"Train loss: {train_loss:.6f} | Train MAE: {train_mae:.6f}")
         print(f"Val   loss: {val_loss:.6f} | Val MAE: {val_mae:.6f} | Pixel Dist: {val_px_dist:.2f}")
 
-        # checkpoint
+        # checkpointing
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
@@ -520,9 +505,9 @@ def main(args):
     print("Training finished. Best val loss:", best_val_loss)
 
 # ---------------------------
-# Inference helper
+# Inference
 # ---------------------------
-def predict_on_crop(model_path, crop_image_path, img_size=640, device="cpu", backbone="hrnet_w18"):
+def predict_on_crop(model_path, crop_image_path, device="cpu", backbone="hrnet_w18"):
     cfg_model = timm.create_model(backbone, pretrained=False, num_classes=0, global_pool="avg")
     data_config = resolve_data_config({}, model=cfg_model)
     transform = transforms.Compose([
@@ -542,7 +527,7 @@ def predict_on_crop(model_path, crop_image_path, img_size=640, device="cpu", bac
     inp = transform(canvas).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        out = model(inp)[0].cpu().numpy()  # normalized px,py
+        out = model(inp)[0].cpu().numpy()
     return float(out[0]), float(out[1])
 
 # ---------------------------
@@ -552,7 +537,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="Dataset", help="dataset folder with images/ and labels/")
     parser.add_argument("--backbone", type=str, default="hrnet_w18", help="timm backbone name")
-    parser.add_argument("--img_size", type=int, default=640, help="input crop size")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -561,8 +545,8 @@ if __name__ == "__main__":
     parser.add_argument("--head_hidden", type=int, default=512)
     parser.add_argument("--val_split", type=float, default=0.15)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--out", type=str, default="hrnet_pluck.pth")
+    parser.add_argument("--out", type=str, default="hrnet_pluck_v003.pth")
     parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--device", type=int, default=0, help="gpu device id, set -1 for cpu")
+    parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
     main(args)
