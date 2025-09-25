@@ -1,0 +1,36 @@
+Date: 24/09/2025
+
+
+1. Here first train for object detection then train using HRNet for plucking point identification. Then combine two approchaes and find the result.
+
+
+Train Details:
+Date: 25/09/2025
+
+1. Code File for Train - train_hrnet_pluck.py
+2. Using Bash : python train_hrnet_pluck.py --data_dir final_dataset --epochs 50 --batch_size 32 --img_size 256 --out hrnet_pluck.pth
+3. Terminal : python train_hrnet_pluck.py --data_dir final_dataset --resume hrnet_pluck.pth --epochs 30
+4. Result will be stored in the base directory.
+5. Installed Library : pip install torch torchvision timm tqdm
+
+
+
+
+####################
+
+Notes, tips & improvements
+
+Data quantity & augmentation — HRNet benefits from diverse data. Add rotations, brightness jitter, small scale augmentations for generalization.
+
+Loss — MSE is OK; consider combining MSE + MAE or use robust losses if outliers present.
+
+Backbone choices — hrnet_w18 is a good balance. If speed is critical, use hrnet_w18_small or a ResNet. If more accuracy needed, explore larger HRNet variants.
+
+Output activation — we use Sigmoid() on head so network directly predicts normalized coordinates. If you prefer unbounded output, remove Sigmoid() and clamp outputs in training/inference.
+
+Validation metric — currently mean absolute error (MAE) is printed (average of per-sample mean(|dx|, |dy|)). You can convert MAE into pixel error if you multiply by crop size.
+
+GPU — training on GPU accelerates a lot. Ensure --device 0 and CUDA visible. The script selects CUDA if available when device >=0.
+
+####################
+ 
